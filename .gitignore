@@ -1,0 +1,7 @@
+package-lock.json
+
+.wal
+
+node_modules
+
+data

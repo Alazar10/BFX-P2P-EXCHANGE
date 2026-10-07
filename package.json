@@ -1,0 +1,14 @@
+{
+  "name": "p2p-engine-core",
+  "version": "1.0.0",
+  "description": "Deterministic Low-Latency P2P Matching Engine over Grenache",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node src/test-master-suite.js"
+  },
+  "dependencies": {
+    "grenache-nodejs-link": "^1.0.2",
+    "grenache-nodejs-ws": "^1.0.0"
+  }
+}
