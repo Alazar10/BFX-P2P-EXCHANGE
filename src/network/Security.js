@@ -4,21 +4,24 @@ const crypto = require('node:crypto');
 
 class SecurityGate {
   /**
-   * @param {string} clusterSecret - Shared cluster secret or master signing secret
+   * @param {string} clusterSecret - Secret used for signing unless an API-key map is supplied
    * @param {number} maxDriftMs - Maximum allowed timestamp drift in ms (default 5000)
+   * @param {Record<string, string>|null} apiKeySecrets - Per-client signing secrets
    */
-  constructor(clusterSecret, maxDriftMs = 5000) {
+  constructor(clusterSecret, maxDriftMs = 5000, apiKeySecrets = null) {
     if (!clusterSecret || typeof clusterSecret !== 'string') {
       throw new Error('SECURITY_INIT_ERROR: clusterSecret must be a valid non-empty string');
     }
     this.clusterSecret = clusterSecret;
     this.maxDriftMs = maxDriftMs;
+    this.apiKeySecrets = apiKeySecrets;
 
     // Outbound client counter: Map<apiKey, bigint>
     this.clientNonces = new Map();
 
     // Inbound verification watermark: Map<apiKey, bigint>
     this.receivedWatermarks = new Map();
+    this.receivedClusterNonces = new Map();
   }
 
   /**
@@ -32,8 +35,75 @@ class SecurityGate {
   }
 
   _canonicalize(apiKey, timestamp, nonce, data) {
-    const serializedData = JSON.stringify(data, Object.keys(data).sort());
+    const serializedData = JSON.stringify(data, (_, value) =>
+      typeof value === 'bigint' ? value.toString() : value
+    );
     return `${apiKey}:${timestamp}:${nonce}:${serializedData}`;
+  }
+
+  _stableSerialize(value) {
+    if (typeof value === 'bigint') return JSON.stringify(value.toString());
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => this._stableSerialize(item)).join(',')}]`;
+    }
+    if (value && typeof value === 'object') {
+      const entries = Object.keys(value)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${this._stableSerialize(value[key])}`);
+      return `{${entries.join(',')}}`;
+    }
+    return JSON.stringify(value);
+  }
+
+  signClusterMessage(nodeId, message) {
+    const timestamp = Date.now();
+    const nonce = crypto.randomUUID();
+    const canonical = `${nodeId}:${timestamp}:${nonce}:${this._stableSerialize(message)}`;
+    const signature = crypto
+      .createHmac('sha256', this.clusterSecret)
+      .update(canonical)
+      .digest('hex');
+
+    return { clusterMessage: true, nodeId, timestamp, nonce, signature, message };
+  }
+
+  verifyClusterMessage(envelope, allowedNodeIds) {
+    if (!envelope || envelope.clusterMessage !== true ||
+        typeof envelope.nodeId !== 'string' ||
+        !allowedNodeIds.includes(envelope.nodeId) ||
+        typeof envelope.timestamp !== 'number' ||
+        typeof envelope.nonce !== 'string' ||
+        typeof envelope.signature !== 'string' ||
+        !envelope.message || typeof envelope.message !== 'object') {
+      throw new Error('CLUSTER_AUTH_REJECT: Malformed or untrusted peer envelope');
+    }
+
+    const now = Date.now();
+    if (Math.abs(now - envelope.timestamp) > this.maxDriftMs) {
+      throw new Error('CLUSTER_AUTH_REJECT: Peer message timestamp expired');
+    }
+
+    const replayKey = `${envelope.nodeId}:${envelope.nonce}`;
+    for (const [key, timestamp] of this.receivedClusterNonces) {
+      if (now - timestamp > this.maxDriftMs) this.receivedClusterNonces.delete(key);
+    }
+    if (this.receivedClusterNonces.has(replayKey)) {
+      throw new Error('CLUSTER_AUTH_REJECT: Replayed peer message');
+    }
+
+    const canonical = `${envelope.nodeId}:${envelope.timestamp}:${envelope.nonce}:${this._stableSerialize(envelope.message)}`;
+    const expectedSig = crypto
+      .createHmac('sha256', this.clusterSecret)
+      .update(canonical)
+      .digest('hex');
+    const sigBuf = Buffer.from(envelope.signature, 'hex');
+    const expBuf = Buffer.from(expectedSig, 'hex');
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      throw new Error('CLUSTER_AUTH_REJECT: Peer signature mismatch');
+    }
+
+    this.receivedClusterNonces.set(replayKey, now);
+    return { nodeId: envelope.nodeId, message: envelope.message };
   }
 
   /**
@@ -57,8 +127,12 @@ class SecurityGate {
     }
 
     const canonical = this._canonicalize(apiKey, timestamp, nonce, data);
+    const signingSecret = this.apiKeySecrets
+      ? this.apiKeySecrets[apiKey]
+      : this.clusterSecret;
+    if (!signingSecret) throw new Error('SECURITY_SIGN_ERROR: Unknown API key');
     const signature = crypto
-      .createHmac('sha256', this.clusterSecret)
+      .createHmac('sha256', signingSecret)
       .update(canonical)
       .digest('hex');
 
@@ -119,9 +193,13 @@ class SecurityGate {
     }
 
     // 3. Cryptographic Signature Verification (Constant-Time)
+    const signingSecret = this.apiKeySecrets
+      ? this.apiKeySecrets[apiKey]
+      : this.clusterSecret;
+    if (!signingSecret) throw new Error('SECURITY_REJECT: Unknown API key');
     const canonical = this._canonicalize(apiKey, timestamp, nonce, data);
     const expectedSig = crypto
-      .createHmac('sha256', this.clusterSecret)
+      .createHmac('sha256', signingSecret)
       .update(canonical)
       .digest('hex');
 

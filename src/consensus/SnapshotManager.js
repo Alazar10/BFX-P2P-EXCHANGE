@@ -57,7 +57,7 @@ class SnapshotManager {
 
     fs.renameSync(this.tempSnapshotPath, this.snapshotPath);
 
-    this._compactWal();
+    this._compactWal(lastAppliedSeqId);
 
     return {
       lastAppliedSeqId,
@@ -99,11 +99,45 @@ class SnapshotManager {
     };
   }
 
-  _compactWal() {
+  installSnapshot(snapshotPayload) {
+    if (!snapshotPayload || snapshotPayload.version !== 1 ||
+        !Array.isArray(snapshotPayload.orders)) {
+      throw new Error('INVALID_SNAPSHOT: Unsupported snapshot payload');
+    }
+    BigInt(snapshotPayload.lastAppliedSeqId);
+
+    const rawData = JSON.stringify(snapshotPayload);
+    const fd = fs.openSync(this.tempSnapshotPath, 'w');
+    try {
+      fs.writeFileSync(fd, rawData);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(this.tempSnapshotPath, this.snapshotPath);
+
+    const result = this.loadSnapshot();
+    this.wal.reset();
+    return result;
+  }
+
+  _compactWal(lastAppliedSeqId) {
+    const retainedRecords = [];
+    let latestTermVote = null;
+    this.wal.replay((record) => {
+      if (record.type === 'RAFT_TERM_VOTE') latestTermVote = record;
+      if (record.type === 'RAFT_PREPARE' &&
+          BigInt(record.seqId) > lastAppliedSeqId) {
+        retainedRecords.push(record);
+      }
+    });
+    if (latestTermVote) retainedRecords.unshift(latestTermVote);
+
     if (this.wal.fd) {
       fs.closeSync(this.wal.fd);
     }
     this.wal.fd = fs.openSync(this.wal.filePath, 'w+');
+    for (const record of retainedRecords) this.wal.append(record);
   }
 }
 

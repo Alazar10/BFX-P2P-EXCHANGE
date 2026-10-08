@@ -6,16 +6,20 @@ const { PeerRPCClient } = require('grenache-nodejs-ws');
 const { SecurityGate } = require('./network/Security');
 
 const SCALE = 100000000n;
-const CLUSTER_SECRET = 'CLUSTER_SECRET_AUTHENTICATION_KEY_V1';
+const API_SECRET = process.env.API_SECRET;
+const API_KEY = process.env.API_KEY;
+if (!API_KEY || !API_SECRET || API_SECRET.length < 32) {
+  throw new Error('CONFIG_ERROR: Set API_KEY and API_SECRET for a configured client account');
+}
 
 const link = new Link({ grape: process.env.GRAPE_URL || 'http://127.0.0.1:40001' });
 link.start();
 
 const peer = new PeerRPCClient(link, {});
 peer.init();
-const security = new SecurityGate(CLUSTER_SECRET);
+const security = new SecurityGate(API_SECRET);
 
-function sendRaw(cmd, apiKey = 'race_tester') {
+function sendRaw(cmd, apiKey = API_KEY) {
   return new Promise((resolve, reject) => {
     const envelope = security.sign(cmd, apiKey);
     peer.request('rpc_order_engine', envelope, { timeout: 5000 }, (err, data) => {
@@ -121,7 +125,7 @@ function sendCustomEnvelope(envelope) {
   const initialNonce = '50000';
   const initialBody = JSON.stringify(testCmd);
   const initialCanonical = `${testApiKey}:${initialTimestamp}:${initialNonce}:${initialBody}`;
-  const initialSig = crypto.createHmac('sha256', CLUSTER_SECRET).update(initialCanonical).digest('hex');
+  const initialSig = crypto.createHmac('sha256', API_SECRET).update(initialCanonical).digest('hex');
 
   await sendCustomEnvelope({
     apiKey: testApiKey,
@@ -137,7 +141,7 @@ function sendCustomEnvelope(envelope) {
     const timestamp = Date.now();
     const bodyStr = JSON.stringify(testCmd);
     const canonical = `${testApiKey}:${timestamp}:${badNonce}:${bodyStr}`;
-    const signature = crypto.createHmac('sha256', CLUSTER_SECRET).update(canonical).digest('hex');
+    const signature = crypto.createHmac('sha256', API_SECRET).update(canonical).digest('hex');
 
     const result = await sendCustomEnvelope({
       apiKey: testApiKey,

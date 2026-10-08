@@ -260,6 +260,7 @@ async function runMasterSuite() {
 
     const router = new LocalMeshRouter();
     const clusterIds = ['node_1', 'node_2', 'node_3'];
+    let rejectAppendAcks = false;
 
     function createRaftPeer(id) {
       const dir = `${MASTER_DATA_DIR}/${id}_data`;
@@ -273,7 +274,11 @@ async function runMasterSuite() {
         sendPeer: async (targetId, msg) => {
           const node = router.nodes.get(targetId);
           if (!node) return null;
-          return node.handleRaftMessage(msg);
+          const response = node.handleRaftMessage(msg);
+          if (rejectAppendAcks && msg.action === 'RAFT_APPEND_ENTRIES') {
+            return { success: false };
+          }
+          return response;
         }
       };
 
@@ -288,8 +293,9 @@ async function runMasterSuite() {
 
     p1.raftNode._becomeLeader();
 
-    for (let i = 1; i <= 500; i++) {
-      await p1.raftNode.submitTransaction({
+    await Promise.all(Array.from({ length: 500 }, (_, index) => {
+      const i = index + 1;
+      return p1.raftNode.submitTransaction({
         type: 'ORDER_CREATE',
         orderId: BigInt(i),
         userId: BigInt((i % 4) + 1),
@@ -298,7 +304,33 @@ async function runMasterSuite() {
         side: i % 2 === 0 ? 0 : 1,
         stpMode: 0
       });
+    }));
+
+    rejectAppendAcks = true;
+    let quorumFailureHandled = false;
+    try {
+      await p1.raftNode.submitTransaction({
+        type: 'ORDER_CREATE',
+        orderId: 999001n,
+        userId: 9n,
+        price: 999999n,
+        amount: 1n,
+        side: 1,
+        stpMode: 0
+      });
+    } catch (error) {
+      quorumFailureHandled = error.message.startsWith('QUORUM_LOST');
     }
+    rejectAppendAcks = false;
+    await p1.raftNode.submitTransaction({
+      type: 'ORDER_CREATE',
+      orderId: 999002n,
+      userId: 9n,
+      price: 999999n,
+      amount: 1n,
+      side: 1,
+      stpMode: 0
+    });
 
     const h1 = calculateOrderBookHash(p1.book);
     const h2 = calculateOrderBookHash(p2.book);
@@ -308,7 +340,14 @@ async function runMasterSuite() {
     p2.wal.close();
     p3.wal.close();
 
-    const consensusPassed = h1 === h2 && h2 === h3 && p1.sequencer.currentSequence === 500n;
+    const retryDidNotApplyRejectedEntry = [p1, p2, p3]
+      .every((peer) => !peer.book.orderMap.has(999001n));
+    const consensusPassed =
+      h1 === h2 &&
+      h2 === h3 &&
+      p1.sequencer.currentSequence === 501n &&
+      quorumFailureHandled &&
+      retryDidNotApplyRejectedEntry;
     console.log(`-> SHA-256 State Hashes across all 3 independent nodes: ${h1.substring(0, 16)}...`);
 
     if (consensusPassed) {

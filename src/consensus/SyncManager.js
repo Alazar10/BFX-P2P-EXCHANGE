@@ -24,14 +24,21 @@ class SyncManager {
 
     if (fs.existsSync(this.sequencer.wal.filePath)) {
       this.sequencer.wal.replay((entry) => {
+        if (entry.type !== 'ORDER_CREATE' && entry.type !== 'ORDER_CANCEL') return;
         const entrySeq = BigInt(entry.seqId);
         if (entrySeq > followerSeq) {
           deltas.push(entry);
         }
       });
-      if (deltas.length > 0 && BigInt(deltas[0].seqId) === followerSeq + 1n) {
-        canDeltaReplay = true;
+      let expectedSeq = followerSeq + 1n;
+      canDeltaReplay = deltas.length > 0;
+      for (const entry of deltas) {
+        if (BigInt(entry.seqId) !== expectedSeq++) {
+          canDeltaReplay = false;
+          break;
+        }
       }
+      canDeltaReplay = canDeltaReplay && expectedSeq - 1n === currentSeq;
     }
 
     if (canDeltaReplay) {
@@ -80,9 +87,12 @@ class SyncManager {
           throw new Error('SYNC_INTEGRITY_VIOLATION: Snapshot checksum mismatch');
         }
 
-        fs.writeFileSync(this.snapshotManager.snapshotPath, raw);
-        this.snapshotManager.loadSnapshot(); // Wipes prior memory before loading
-        this.sequencer.currentSequence = BigInt(response.snapshotPayload.lastAppliedSeqId);
+        const snapshotSeq = BigInt(response.snapshotPayload.lastAppliedSeqId);
+        if (snapshotSeq < mySeq) {
+          throw new Error('SYNC_REGRESSION: Leader snapshot is behind follower state');
+        }
+        this.snapshotManager.installSnapshot(response.snapshotPayload);
+        this.sequencer.currentSequence = snapshotSeq;
       }
     } finally {
       this.sequencer.isPaused = false;

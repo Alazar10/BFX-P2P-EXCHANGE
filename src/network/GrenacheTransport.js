@@ -80,8 +80,9 @@ class GrenacheTransport {
    * Sends an RPC payload to a specific key or peer
    */
   sendPeer(peerKey, payload, timeout = 5000) {
+    const serviceKey = peerKey.startsWith('rpc_node_') ? peerKey : `rpc_node_${peerKey}`;
     return new Promise((resolve, reject) => {
-      this.peerClient.request(peerKey, payload, { timeout }, (err, data) => {
+      this.peerClient.request(serviceKey, payload, { timeout }, (err, data) => {
         if (err) return reject(new Error(typeof err === 'string' ? err : err.message));
         resolve(data);
       });

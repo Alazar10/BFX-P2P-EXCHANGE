@@ -22,8 +22,12 @@ class Sequencer {
 
     let replayed = 0;
     this.wal.replay((entry) => {
+      if (entry.type !== 'ORDER_CREATE' && entry.type !== 'ORDER_CANCEL') return;
       const entrySeqId = BigInt(entry.seqId);
       if (entrySeqId > this.currentSequence) {
+        if (entrySeqId !== this.currentSequence + 1n) {
+          throw new Error(`WAL_SEQUENCE_GAP: Expected ${this.currentSequence + 1n}, received ${entrySeqId}`);
+        }
         this.currentSequence = entrySeqId;
         this._applyStateTransition(entry);
         replayed++;
@@ -36,19 +40,11 @@ class Sequencer {
    */
   process(command) {
     if (this.isPaused) throw new Error('SEQUENCER_PAUSED_FOR_SYNC');
-    const seqId = ++this.currentSequence;
-    const timestamp = Date.now();
-    const entry = { ...command, seqId: seqId.toString(), timestamp };
-
-    this.wal.append(entry);
-    const fills = this._applyStateTransition(entry);
-
-    if (++this.opsSinceLastSnapshot >= this.snapshotInterval) {
-      this.checkpoint();
-      this.opsSinceLastSnapshot = 0;
-    }
-
-    return { seqId, fills };
+    return this.applyCommitted({
+      ...command,
+      seqId: (this.currentSequence + 1n).toString(),
+      timestamp: Date.now()
+    });
   }
 
   /**
@@ -60,10 +56,13 @@ class Sequencer {
     if (entrySeqId <= this.currentSequence) {
       return { seqId: entrySeqId, fills: [], ignored: true };
     }
+    if (entrySeqId !== this.currentSequence + 1n) {
+      throw new Error(`SEQUENCE_GAP: Expected ${this.currentSequence + 1n}, received ${entrySeqId}`);
+    }
 
-    this.currentSequence = entrySeqId;
     this.wal.append(entry);
     const fills = this._applyStateTransition(entry);
+    this.currentSequence = entrySeqId;
 
     if (++this.opsSinceLastSnapshot >= this.snapshotInterval) {
       this.checkpoint();
@@ -89,7 +88,9 @@ class Sequencer {
       );
       return res.fills;
     } else if (payload.type === 'ORDER_CANCEL') {
-      const reqUserId = payload.userId ? BigInt(payload.userId) : null;
+      const reqUserId = payload.userId !== undefined && payload.userId !== null
+        ? BigInt(payload.userId)
+        : null;
       this.engine.book.cancel(BigInt(payload.orderId), reqUserId);
       return [];
     }

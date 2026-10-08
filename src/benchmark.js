@@ -5,7 +5,11 @@ const { PeerRPCClient } = require('grenache-nodejs-ws');
 const { SecurityGate } = require('./network/Security');
 
 const SCALE = 100000000n;
-const CLUSTER_SECRET = 'CLUSTER_SECRET_AUTHENTICATION_KEY_V1';
+const API_KEY = process.env.API_KEY;
+const API_SECRET = process.env.API_SECRET;
+if (!API_KEY || !API_SECRET || API_SECRET.length < 32) {
+  throw new Error('CONFIG_ERROR: Set API_KEY and API_SECRET (at least 32 characters)');
+}
 const TOTAL_ORDERS = 5000;
 const CONCURRENCY = 20;
 
@@ -14,7 +18,7 @@ link.start();
 
 const peer = new PeerRPCClient(link, { maxActiveKeyDests: 10 });
 peer.init();
-const security = new SecurityGate(CLUSTER_SECRET);
+const security = new SecurityGate(API_SECRET);
 
 let orderCounter = 0n;
 
@@ -35,7 +39,7 @@ function sendBenchmarkOrder(i) {
       stpMode: 0
     };
 
-    const envelope = security.sign(cmd, `benchmark_user_${userId}`);
+    const envelope = security.sign(cmd, API_KEY);
     const start = process.hrtime.bigint();
 
     peer.request('rpc_order_engine', envelope, { timeout: 10000 }, (err, data) => {

@@ -20,7 +20,7 @@ class MatchingEngine {
    * Deterministic matching cycle
    * @returns {{ fills: Array<object>, remainingAmount: bigint }}
    */
-  processOrder(orderId, userId, price, amount, side, stpMode = STPMode.NONE) {
+  processOrder(orderId, userId, price, amount, side, stpMode = STPMode.CANCEL_TAKER) {
     let remainingAmount = amount;
     const fills = [];
 

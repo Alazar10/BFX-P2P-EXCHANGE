@@ -5,7 +5,11 @@ const { PeerRPCClient } = require('grenache-nodejs-ws');
 const { SecurityGate } = require('./network/Security');
 
 const SCALE = 100000000n; // 1 BTC = 10^8 Satoshis
-const CLUSTER_SECRET = 'CLUSTER_SECRET_AUTHENTICATION_KEY_V1';
+const API_KEY = process.env.API_KEY;
+const API_SECRET = process.env.API_SECRET;
+if (!API_KEY || !API_SECRET || API_SECRET.length < 32) {
+  throw new Error('CONFIG_ERROR: Set API_KEY and API_SECRET (at least 32 characters)');
+}
 
 const link = new Link({
   grape: process.env.GRAPE_URL || 'http://127.0.0.1:40001'
@@ -15,11 +19,11 @@ link.start();
 const peer = new PeerRPCClient(link, {});
 peer.init();
 
-const security = new SecurityGate(CLUSTER_SECRET);
+const security = new SecurityGate(API_SECRET);
 
-function sendOrder(command, apiKey = 'trader_bot_alpha') {
+function sendOrder(command, apiKey = API_KEY) {
   return new Promise((resolve, reject) => {
-    const envelope = security.sign(command, apiKey);
+    const envelope = security.sign(command, apiKey || API_KEY);
 
     peer.request('rpc_order_engine', envelope, { timeout: 10000 }, (err, data) => {
       if (err) return reject(new Error(typeof err === 'string' ? err : err.message));
@@ -44,7 +48,7 @@ function sendOrder(command, apiKey = 'trader_bot_alpha') {
       price: (65000n * SCALE).toString(),
       amount: (2n * SCALE).toString(),
       side: 1, // SELL
-      stpMode: 0 // CANCEL_TAKER
+      stpMode: 1 // CANCEL_TAKER
     });
     console.log('Result 1 (Ask Placed):', res1);
 
@@ -56,7 +60,7 @@ function sendOrder(command, apiKey = 'trader_bot_alpha') {
       price: (65000n * SCALE).toString(),
       amount: ((75n * SCALE) / 100n).toString(),
       side: 0, // BUY
-      stpMode: 0
+      stpMode: 1
     });
     console.log('Result 2 (Trade Executed):', res2);
 
@@ -68,7 +72,7 @@ function sendOrder(command, apiKey = 'trader_bot_alpha') {
       price: (65000n * SCALE).toString(),
       amount: (1n * SCALE).toString(),
       side: 0, // BUY
-      stpMode: 0 // CANCEL_TAKER
+      stpMode: 1 // CANCEL_TAKER
     });
     console.log('Result 3 (STP Triggered):', res3);
 
