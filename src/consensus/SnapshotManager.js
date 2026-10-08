@@ -77,8 +77,11 @@ class SnapshotManager {
 
     const rawData = fs.readFileSync(this.snapshotPath, 'utf8');
     const snapshot = JSON.parse(rawData);
-
     const lastAppliedSeqId = BigInt(snapshot.lastAppliedSeqId);
+
+    // Clean reset of in-memory structures
+    this.book.clear();
+    this.pool.reset();
 
     for (const ord of snapshot.orders) {
       this.book.addRestingOrder(

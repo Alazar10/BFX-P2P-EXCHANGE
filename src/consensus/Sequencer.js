@@ -3,12 +3,6 @@
 const { SnapshotManager } = require('./SnapshotManager');
 
 class Sequencer {
-  /**
-   * @param {import('../engine/MatchingEngine').MatchingEngine} engine
-   * @param {import('./WriteAheadLog').WriteAheadLog} wal
-   * @param {number} snapshotInterval - Snapshot frequency in ticks
-   * @param {string} dataDir - Isolated directory for snapshots
-   */
   constructor(engine, wal, snapshotInterval = 5000, dataDir = './data') {
     this.engine = engine;
     this.wal = wal;
@@ -16,46 +10,38 @@ class Sequencer {
     this.dataDir = dataDir;
     this.currentSequence = 0n;
     this.opsSinceLastSnapshot = 0;
+    this.isPaused = false;
 
     this.snapshotManager = new SnapshotManager(engine.book, wal, this.dataDir);
-
     this._recoverState();
   }
 
   _recoverState() {
-    const startTime = process.hrtime.bigint();
-
     const { lastAppliedSeqId, loadedOrders } = this.snapshotManager.loadSnapshot();
     this.currentSequence = lastAppliedSeqId;
 
-    let replayedDeltas = 0;
-
+    let replayed = 0;
     this.wal.replay((entry) => {
       const entrySeqId = BigInt(entry.seqId);
       if (entrySeqId > this.currentSequence) {
         this.currentSequence = entrySeqId;
         this._applyStateTransition(entry);
-        replayedDeltas++;
+        replayed++;
       }
     });
-
-    const elapsedMs = Number(process.hrtime.bigint() - startTime) / 1_000_000;
-    if (loadedOrders > 0 || replayedDeltas > 0) {
-      console.log(`[State Recovery] Loaded ${loadedOrders} resting orders from snapshot (${this.dataDir}).`);
-      console.log(`[State Recovery] Replayed ${replayedDeltas} deltas from WAL.`);
-      console.log(`[State Recovery] Engine restored to Seq #${this.currentSequence} in ${elapsedMs.toFixed(3)} ms\n`);
-    }
   }
 
+  /**
+   * Standalone / Leader execution: assigns monotonic sequence ID and applies state.
+   */
   process(command) {
+    if (this.isPaused) throw new Error('SEQUENCER_PAUSED_FOR_SYNC');
     const seqId = ++this.currentSequence;
     const timestamp = Date.now();
+    const entry = { ...command, seqId: seqId.toString(), timestamp };
 
-    const payload = { ...command, seqId, timestamp };
-
-    this.wal.append(payload);
-
-    const fills = this._applyStateTransition(payload);
+    this.wal.append(entry);
+    const fills = this._applyStateTransition(entry);
 
     if (++this.opsSinceLastSnapshot >= this.snapshotInterval) {
       this.checkpoint();
@@ -65,9 +51,30 @@ class Sequencer {
     return { seqId, fills };
   }
 
+  /**
+   * Applies an entry that has reached consensus (or follower commit).
+   * Guarantees exact monotonic execution without re-incrementing seqId.
+   */
+  applyCommitted(entry) {
+    const entrySeqId = BigInt(entry.seqId);
+    if (entrySeqId <= this.currentSequence) {
+      return { seqId: entrySeqId, fills: [], ignored: true };
+    }
+
+    this.currentSequence = entrySeqId;
+    this.wal.append(entry);
+    const fills = this._applyStateTransition(entry);
+
+    if (++this.opsSinceLastSnapshot >= this.snapshotInterval) {
+      this.checkpoint();
+      this.opsSinceLastSnapshot = 0;
+    }
+
+    return { seqId: entrySeqId, fills };
+  }
+
   checkpoint() {
-    const info = this.snapshotManager.createSnapshot(this.currentSequence);
-    console.log(`[Checkpoint] Snapshot created at Seq #${info.lastAppliedSeqId} (${info.restingOrdersCount} active orders in ${this.dataDir})`);
+    return this.snapshotManager.createSnapshot(this.currentSequence);
   }
 
   _applyStateTransition(payload) {
@@ -78,11 +85,12 @@ class Sequencer {
         BigInt(payload.price),
         BigInt(payload.amount),
         Number(payload.side),
-        Number(payload.stpMode)
+        Number(payload.stpMode || 0)
       );
       return res.fills;
     } else if (payload.type === 'ORDER_CANCEL') {
-      this.engine.book.cancel(BigInt(payload.orderId));
+      const reqUserId = payload.userId ? BigInt(payload.userId) : null;
+      this.engine.book.cancel(BigInt(payload.orderId), reqUserId);
       return [];
     }
     return [];

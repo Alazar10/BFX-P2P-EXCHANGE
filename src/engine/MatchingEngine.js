@@ -1,9 +1,10 @@
 'use strict';
 
 const STPMode = Object.freeze({
-  CANCEL_TAKER: 0,
-  CANCEL_MAKER: 1,
-  CANCEL_BOTH: 2
+  NONE: 0,
+  CANCEL_TAKER: 1,
+  CANCEL_MAKER: 2,
+  CANCEL_BOTH: 3
 });
 
 class MatchingEngine {
@@ -15,86 +16,90 @@ class MatchingEngine {
     this.pool = book.pool;
   }
 
-  processOrder(orderId, userId, price, amount, side, stpMode = STPMode.CANCEL_TAKER) {
-    if (typeof orderId !== 'bigint' || typeof userId !== 'bigint' ||
-        typeof price !== 'bigint' || typeof amount !== 'bigint') {
-      throw new TypeError('MatchingEngine: Numeric parameters must be BigInt');
-    }
-    if (price <= 0n || amount <= 0n) {
-      throw new RangeError('MatchingEngine: Price and amount must be positive non-zero BigInts');
-    }
-
+  /**
+   * Deterministic matching cycle
+   * @returns {{ fills: Array<object>, remainingAmount: bigint }}
+   */
+  processOrder(orderId, userId, price, amount, side, stpMode = STPMode.NONE) {
+    let remainingAmount = amount;
     const fills = [];
-    let remaining = amount;
 
+    // Taker is BUY (side 0) -> matches against resting ASKS (ascending)
+    // Taker is SELL (side 1) -> matches against resting BIDS (descending)
     const isBuy = side === 0;
-    const opposingLevels = isBuy ? this.book.asks : this.book.bids;
-    const sortedPrices = isBuy ? this.book.sortedAskPrices : this.book.sortedBidPrices;
 
-    while (sortedPrices.length > 0 && remaining > 0n) {
-      const bestPrice = sortedPrices[0];
+    while (remainingAmount > 0n) {
+      const priceLevels = isBuy ? this.book.sortedAskPrices : this.book.sortedBidPrices;
+      if (!priceLevels || priceLevels.length === 0) break;
 
-      if (isBuy && price < bestPrice) break;
-      if (!isBuy && price > bestPrice) break;
+      const bestPrice = priceLevels[0];
 
-      const level = opposingLevels.get(bestPrice);
-      let makerPtr = level.queue.head;
+      // Price limit check
+      if (isBuy && bestPrice > price) break;
+      if (!isBuy && bestPrice < price) break;
 
-      while (makerPtr !== -1 && remaining > 0n) {
-        const nextMakerPtr = this.pool.next[makerPtr];
-        const makerUserId = this.pool.userId[makerPtr];
-        const makerOrderId = this.pool.id[makerPtr];
-
-        if (makerUserId === userId) {
-          if (stpMode === STPMode.CANCEL_TAKER) {
-            return { fills, remainingAmount: 0n };
-          }
-          if (stpMode === STPMode.CANCEL_MAKER || stpMode === STPMode.CANCEL_BOTH) {
-            this.book.cancel(makerOrderId);
-            if (stpMode === STPMode.CANCEL_BOTH) {
-              return { fills, remainingAmount: 0n };
-            }
-            makerPtr = nextMakerPtr;
-            continue;
-          }
-        }
-
-        const makerAmount = this.pool.amount[makerPtr];
-        const fillAmount = remaining < makerAmount ? remaining : makerAmount;
-
-        fills.push({
-          makerOrderId,
-          takerOrderId: orderId,
-          price: bestPrice,
-          amount: fillAmount,
-          makerUserId,
-          takerUserId: userId
-        });
-
-        remaining -= fillAmount;
-        this.pool.amount[makerPtr] -= fillAmount;
-        level.totalVolume -= fillAmount;
-
-        if (this.pool.amount[makerPtr] === 0n) {
-          level.queue.remove(makerPtr);
-          this.book.orderMap.delete(makerOrderId);
-          this.pool.free(makerPtr);
-        }
-
-        makerPtr = nextMakerPtr;
+      const tree = isBuy ? this.book.asks : this.book.bids;
+      const level = tree.get(bestPrice);
+      if (!level || !level.queue || level.queue.head === -1) {
+        // Empty level guard
+        priceLevels.shift();
+        tree.delete(bestPrice);
+        continue;
       }
 
-      if (level.queue.isEmpty()) {
-        opposingLevels.delete(bestPrice);
-        sortedPrices.shift();
+      const makerPtr = level.queue.head;
+      const makerUserId = this.pool.userId[makerPtr];
+      const makerOrderId = this.pool.orderId[makerPtr];
+      const makerAmount = this.pool.amount[makerPtr];
+
+      // 1. Native Self-Trade Prevention (STP) Intercept
+      if (makerUserId === userId && stpMode !== STPMode.NONE) {
+        if (stpMode === STPMode.CANCEL_TAKER) {
+          remainingAmount = 0n;
+          break; // Stop matching; taker cancelled
+        } else if (stpMode === STPMode.CANCEL_MAKER) {
+          this.book.cancel(makerOrderId);
+          continue; // Maker cancelled; continue matching against next order
+        } else if (stpMode === STPMode.CANCEL_BOTH) {
+          this.book.cancel(makerOrderId);
+          remainingAmount = 0n;
+          break;
+        }
+      }
+
+      // 2. Compute fill execution
+      const fillAmount = remainingAmount < makerAmount ? remainingAmount : makerAmount;
+
+      fills.push({
+        makerOrderId,
+        takerOrderId: orderId,
+        price: bestPrice,
+        amount: fillAmount,
+        makerUserId,
+        takerUserId: userId
+      });
+
+      remainingAmount -= fillAmount;
+      const updatedMakerAmount = makerAmount - fillAmount;
+
+      if (updatedMakerAmount === 0n) {
+        // Fully filled maker order: remove from book and pool
+        this.book.cancel(makerOrderId);
+      } else {
+        // Partial fill: update resting order amount and level total volume
+        this.pool.amount[makerPtr] = updatedMakerAmount;
+        if (level.totalVolume !== undefined) {
+          level.totalVolume -= fillAmount;
+        }
       }
     }
 
-    if (remaining > 0n) {
-      this.book.addRestingOrder(orderId, userId, price, remaining, side);
+    // 3. Any unfilled balance rests on the book
+    if (remainingAmount > 0n) {
+      this.book.addRestingOrder(orderId, userId, price, remainingAmount, side);
     }
 
-    return { fills, remainingAmount: remaining };
+    return { fills, remainingAmount };
   }
 }
 

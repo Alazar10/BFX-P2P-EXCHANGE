@@ -9,12 +9,6 @@ const NodeRole = Object.freeze({
 });
 
 class RaftPeerNode extends EventEmitter {
-  /**
-   * @param {string} nodeId - Unique peer ID (e.g. "peer_1")
-   * @param {string[]} clusterPeers - List of peer IDs in cluster
-   * @param {import('./Sequencer').Sequencer} sequencer
-   * @param {import('../network/GrenacheTransport').GrenacheTransport} transport
-   */
   constructor(nodeId, clusterPeers, sequencer, transport) {
     super();
     this.nodeId = nodeId;
@@ -26,6 +20,11 @@ class RaftPeerNode extends EventEmitter {
     this.currentTerm = 0;
     this.votedFor = null;
     this.leaderId = null;
+
+    // Ordered log of uncommitted entries: Map<seqIdStr, entry>
+    this.uncommittedLog = new Map();
+    this.commitIndex = this.sequencer.currentSequence;
+    this.nextSeqId = this.sequencer.currentSequence;
 
     this.heartbeatInterval = 1000;
     this.electionTimeoutMin = 2500;
@@ -47,15 +46,12 @@ class RaftPeerNode extends EventEmitter {
     this.role = NodeRole.CANDIDATE;
     this.currentTerm++;
     this.votedFor = this.nodeId;
-    console.log(`[Raft] ${this.nodeId}: Election timeout reached. Starting election for Term ${this.currentTerm}...`);
-
-    let votes = 1; // Vote for self
+    let votes = 1;
     this._resetElectionTimer();
 
     for (const peerId of this.clusterPeers) {
       if (peerId === this.nodeId) continue;
-      
-      this.transport.send({
+      this.transport.sendPeer(peerId, {
         action: 'RAFT_REQUEST_VOTE',
         term: this.currentTerm,
         candidateId: this.nodeId,
@@ -74,42 +70,53 @@ class RaftPeerNode extends EventEmitter {
   _becomeLeader() {
     this.role = NodeRole.LEADER;
     this.leaderId = this.nodeId;
+    this.nextSeqId = this.sequencer.currentSequence;
     if (this.timer) clearTimeout(this.timer);
-    console.log(`\n>>> [Raft] CLUSTER LEADER ELECTED: ${this.nodeId} (Term ${this.currentTerm}) <<<\n`);
-
     this.heartbeatTimer = setInterval(() => this._broadcastHeartbeat(), this.heartbeatInterval);
   }
 
   _broadcastHeartbeat() {
     for (const peerId of this.clusterPeers) {
       if (peerId === this.nodeId) continue;
-      this.transport.send({
+      this.transport.sendPeer(peerId, {
         action: 'RAFT_HEARTBEAT',
         term: this.currentTerm,
         leaderId: this.nodeId,
-        lastSeqId: this.sequencer.currentSequence.toString()
+        lastSeqId: this.sequencer.currentSequence.toString(),
+        commitIndex: this.commitIndex.toString()
       }).catch(() => {});
     }
   }
 
+  /**
+   * Two-Phase Consensus: Propose -> Quorum Ack -> Commit & Mutate State
+   */
   async submitTransaction(command) {
     if (this.role !== NodeRole.LEADER) {
       if (!this.leaderId) throw new Error('NO_LEADER_ELECTED_YET');
-      return this.transport.send({
+      return this.transport.sendPeer(this.leaderId, {
         action: 'FORWARD_ORDER_TO_LEADER',
-        leaderId: this.leaderId,
         command
       });
     }
 
-    const nextSeqId = this.sequencer.currentSequence + 1n;
-    const logEntry = { ...command, seqId: nextSeqId.toString() };
+    // 1. Assign strict next sequence without mutating state yet
+    const assignedSeq = ++this.nextSeqId;
+    const logEntry = {
+      ...command,
+      seqId: assignedSeq.toString(),
+      timestamp: Date.now()
+    };
 
-    let acks = 1;
+    // 2. Stage locally in uncommitted log
+    this.uncommittedLog.set(logEntry.seqId, logEntry);
+
+    // 3. Replicate to Quorum
+    let acks = 1; // Leader vote
     const replicationPromises = this.clusterPeers
       .filter((id) => id !== this.nodeId)
       .map((id) =>
-        this.transport.send({
+        this.transport.sendPeer(id, {
           action: 'RAFT_APPEND_ENTRIES',
           term: this.currentTerm,
           leaderId: this.nodeId,
@@ -121,30 +128,54 @@ class RaftPeerNode extends EventEmitter {
 
     await Promise.all(replicationPromises);
 
+    // If quorum lost, fail cleanly without having mutated state
     if (acks <= Math.floor(this.clusterPeers.length / 2)) {
-      throw new Error('CONSENSUS_QUORUM_LOST: Order rejected to prevent split-brain divergence.');
+      this.uncommittedLog.delete(logEntry.seqId);
+      throw new Error('QUORUM_LOST: Order rejected to prevent split-brain state.');
     }
 
-    const result = this.sequencer.process(command);
+    // 4. Commit and Apply locally on leader
+    const execResult = this.sequencer.applyCommitted(logEntry);
+    this.commitIndex = assignedSeq;
+    this.uncommittedLog.delete(logEntry.seqId);
 
-    this.transport.send({
-      action: 'RAFT_COMMIT',
-      seqId: nextSeqId.toString()
-    }).catch(() => {});
+    // 5. Notify followers of commit
+    for (const id of this.clusterPeers) {
+      if (id !== this.nodeId) {
+        this.transport.sendPeer(id, {
+          action: 'RAFT_COMMIT',
+          seqId: logEntry.seqId
+        }).catch(() => {});
+      }
+    }
 
-    return result;
+    return execResult;
   }
 
   handleRaftMessage(msg) {
     if (msg.action === 'RAFT_REQUEST_VOTE') {
+      let voteGranted = false;
+      const candidateLastSeq = BigInt(msg.lastSeqId || '0');
+      const localLastSeq = this.sequencer.currentSequence;
+
       if (msg.term > this.currentTerm) {
         this.currentTerm = msg.term;
         this.role = NodeRole.FOLLOWER;
+        this.votedFor = null;
+      }
+
+      // Safe Vote Rule: Term must match, not yet voted for another, and candidate log >= local log
+      if (
+        msg.term === this.currentTerm &&
+        (this.votedFor === null || this.votedFor === msg.candidateId) &&
+        candidateLastSeq >= localLastSeq
+      ) {
+        voteGranted = true;
         this.votedFor = msg.candidateId;
         this._resetElectionTimer();
-        return { voteGranted: true };
       }
-      return { voteGranted: false };
+
+      return { voteGranted, term: this.currentTerm };
     }
 
     if (msg.action === 'RAFT_HEARTBEAT') {
@@ -160,18 +191,29 @@ class RaftPeerNode extends EventEmitter {
 
     if (msg.action === 'RAFT_APPEND_ENTRIES') {
       this._resetElectionTimer();
-
-      this.pendingEntry = msg.entry;
+      // Store in uncommitted buffer
+      this.uncommittedLog.set(msg.entry.seqId, msg.entry);
       return { success: true };
     }
 
     if (msg.action === 'RAFT_COMMIT') {
-      if (this.pendingEntry && this.pendingEntry.seqId === msg.seqId) {
+      // Contiguous Commit Drain: apply entries strictly in monotonic order
+      let targetSeq = BigInt(msg.seqId);
+      
+      // If entry exists, ensure we apply contiguously
+      while (true) {
+        const nextTarget = (this.sequencer.currentSequence + 1n).toString();
+        const nextEntry = this.uncommittedLog.get(nextTarget);
+        if (!nextEntry) break;
 
-        this.sequencer.process(this.pendingEntry);
-        this.pendingEntry = null;
-        return { success: true };
+        this.sequencer.applyCommitted(nextEntry);
+        this.uncommittedLog.delete(nextTarget);
       }
+      return { success: true, currentSeq: this.sequencer.currentSequence.toString() };
+    }
+
+    if (msg.action === 'FORWARD_ORDER_TO_LEADER') {
+      return this.submitTransaction(msg.command);
     }
 
     return { error: 'UNKNOWN_RAFT_ACTION' };

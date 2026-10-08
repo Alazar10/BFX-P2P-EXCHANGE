@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
@@ -13,6 +14,8 @@ const { SnapshotManager } = require('./consensus/SnapshotManager');
 const { SyncManager } = require('./consensus/SyncManager');
 const { RaftPeerNode } = require('./consensus/RaftPeerNode');
 const { SecurityGate } = require('./network/Security');
+
+const MASTER_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'bfx-master-test-'));
 
 const SCALE = 100000000n;
 const CLUSTER_SECRET = 'MASTER_SUITE_CLUSTER_SECRET_KEY';
@@ -29,7 +32,7 @@ function calculateOrderBookHash(book) {
   return crypto.createHash('sha256').update(entries.join('|')).digest('hex');
 }
 
-const MASTER_DATA_DIR = './data/master_test_sandbox';
+//const MASTER_DATA_DIR = './data/master_test_sandbox';
 fs.rmSync(MASTER_DATA_DIR, { recursive: true, force: true });
 fs.mkdirSync(MASTER_DATA_DIR, { recursive: true });
 
@@ -265,8 +268,13 @@ async function runMasterSuite() {
       const engine = new MatchingEngine(book);
       const wal = new WriteAheadLog(`${dir}/engine.wal`);
       const sequencer = new Sequencer(engine, wal, 10000, dir);
+
       const transport = {
-        send: async (msg) => router.route(id, msg)
+        sendPeer: async (targetId, msg) => {
+          const node = router.nodes.get(targetId);
+          if (!node) return null;
+          return node.handleRaftMessage(msg);
+        }
       };
 
       const raftNode = new RaftPeerNode(id, clusterIds, sequencer, transport);

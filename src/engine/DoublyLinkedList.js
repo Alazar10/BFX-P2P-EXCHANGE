@@ -29,7 +29,7 @@ class DoublyLinkedList {
    * Unlinks an order pointer from anywhere in the list in O(1)
    * @param {number} ptr
    */
-  remove(ptr) {
+  unlink(ptr) {
     const prev = this.pool.prev[ptr];
     const next = this.pool.next[ptr];
 
@@ -47,6 +47,11 @@ class DoublyLinkedList {
 
     this.pool.prev[ptr] = -1;
     this.pool.next[ptr] = -1;
+    this.length--;
+  }
+
+  remove(ptr) {
+    return this.unlink(ptr);
   }
 
   isEmpty() {

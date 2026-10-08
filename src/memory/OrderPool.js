@@ -2,70 +2,99 @@
 
 class OrderPool {
   /**
-   * @param {number} capacity - Maximum concurrent resting order slots
+   * Contiguous TypedArray Arena for orders.
+   * Eliminates dynamic V8 heap object creation and GC pauses during trading.
+   * @param {number} capacity - Maximum number of concurrent active orders
    */
-  constructor(capacity = 200000) {
-    if (typeof capacity !== 'number' || capacity <= 0 || !Number.isInteger(capacity)) {
-      throw new TypeError('OrderPool: capacity must be a positive integer');
-    }
-
+  constructor(capacity = 500000) {
     this.capacity = capacity;
+    this.allocatedCount = 0;
+    this.freeHead = 0;
 
-    this.id = new BigUint64Array(capacity);
+    // Fixed-size columnar arrays (structure of arrays)
+    this.orderId = new BigUint64Array(capacity);
     this.userId = new BigUint64Array(capacity);
     this.price = new BigUint64Array(capacity);
     this.amount = new BigUint64Array(capacity);
-    this.side = new Uint8Array(capacity); // 0 = BUY, 1 = SELL
-    this.prev = new Int32Array(capacity).fill(-1);
-    this.next = new Int32Array(capacity).fill(-1);
+    this.side = new Uint8Array(capacity); // 0 = BID, 1 = ASK
 
-    this.freeList = new Int32Array(capacity);
-    this.freeHead = capacity - 1;
+    // Intrusive doubly linked list pointers for O(1) queue splicing
+    this.prev = new Int32Array(capacity);
+    this.next = new Int32Array(capacity);
 
-    for (let i = 0; i < capacity; i++) {
-      this.freeList[i] = i;
+    // Initialize free list chain
+    this._initFreeList();
+  }
+
+  _initFreeList() {
+    this.freeHead = 0;
+    this.allocatedCount = 0;
+    for (let i = 0; i < this.capacity; i++) {
+      this.next[i] = i + 1 < this.capacity ? i + 1 : -1;
+      this.prev[i] = -1;
+      this.orderId[i] = 0n;
+      this.userId[i] = 0n;
+      this.price[i] = 0n;
+      this.amount[i] = 0n;
+      this.side[i] = 0;
     }
   }
 
   /**
-   * O(1) Memory allocation
-   * @returns {number} pointer index
+   * Resets the entire arena back to clean initial state.
+   * Used during snapshot hydration without reallocating buffers.
    */
-  allocate(id, userId, price, amount, side) {
-    if (typeof id !== 'bigint' || typeof userId !== 'bigint' || 
-        typeof price !== 'bigint' || typeof amount !== 'bigint') {
-      throw new TypeError('OrderPool.allocate: id, userId, price, and amount MUST be BigInt');
-    }
-    if (typeof side !== 'number' || (side !== 0 && side !== 1)) {
-      throw new TypeError('OrderPool.allocate: side must be 0 (BUY) or 1 (SELL)');
-    }
-    if (this.freeHead < 0) {
-      throw new RangeError('CRITICAL: OrderPool exhausted. Increase arena capacity.');
+  reset() {
+    this._initFreeList();
+  }
+
+  /**
+   * Allocates an order slot in O(1) time.
+   * @returns {number} Memory pointer index
+   */
+  alloc(orderId, userId, price, amount, side) {
+    if (this.freeHead === -1) {
+      throw new Error(`ORDER_POOL_EXHAUSTED: Capacity of ${this.capacity} reached`);
     }
 
-    const ptr = this.freeList[this.freeHead--];
-    this.id[ptr] = id;
-    this.userId[ptr] = userId;
-    this.price[ptr] = price;
-    this.amount[ptr] = amount;
-    this.side[ptr] = side;
+    const ptr = this.freeHead;
+    this.freeHead = this.next[ptr];
+
+    this.orderId[ptr] = BigInt(orderId);
+    this.userId[ptr] = BigInt(userId);
+    this.price[ptr] = BigInt(price);
+    this.amount[ptr] = BigInt(amount);
+    this.side[ptr] = Number(side);
+
     this.prev[ptr] = -1;
     this.next[ptr] = -1;
+    this.allocatedCount++;
 
     return ptr;
   }
 
+  // Alias for backward compatibility
+  allocate(orderId, userId, price, amount, side) {
+    return this.alloc(orderId, userId, price, amount, side);
+  }
+
   /**
-   * O(1) Memory deallocation
-   * @param {number} ptr
+   * Releases an order slot back to the free list in O(1) time.
+   * @param {number} ptr - Memory pointer index
    */
   free(ptr) {
-    if (typeof ptr !== 'number' || ptr < 0 || ptr >= this.capacity) {
-      throw new RangeError('OrderPool.free: Invalid pointer index');
-    }
+    if (ptr < 0 || ptr >= this.capacity) return;
+
+    this.orderId[ptr] = 0n;
+    this.userId[ptr] = 0n;
+    this.price[ptr] = 0n;
+    this.amount[ptr] = 0n;
+    this.side[ptr] = 0;
     this.prev[ptr] = -1;
-    this.next[ptr] = -1;
-    this.freeList[++this.freeHead] = ptr;
+
+    this.next[ptr] = this.freeHead;
+    this.freeHead = ptr;
+    this.allocatedCount--;
   }
 }
 

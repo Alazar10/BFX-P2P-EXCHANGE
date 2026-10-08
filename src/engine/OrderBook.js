@@ -8,66 +8,98 @@ class OrderBook {
    */
   constructor(pool) {
     this.pool = pool;
-
-    /** @type {Map<bigint, number>} orderId -> pool pointer */
+    this.bids = new Map();
+    this.asks = new Map();
     this.orderMap = new Map();
 
-    /** @type {Map<bigint, {price: bigint, totalVolume: bigint, queue: DoublyLinkedList}>} */
-    this.bids = new Map();
-    /** @type {Map<bigint, {price: bigint, totalVolume: bigint, queue: DoublyLinkedList}>} */
-    this.asks = new Map();
-
-    /** @type {bigint[]} */
+    // Expose both naming conventions for sorted price levels
     this.sortedBidPrices = [];
-    /** @type {bigint[]} */
+    this.sortedAskPrices = [];
+  }
+
+  // Compatibility getters/aliases
+  get sortedBids() {
+    return this.sortedBidPrices;
+  }
+  get sortedAsks() {
+    return this.sortedAskPrices;
+  }
+
+  getBestBid() {
+    return this.sortedBidPrices.length > 0 ? this.sortedBidPrices[0] : null;
+  }
+
+  getBestAsk() {
+    return this.sortedAskPrices.length > 0 ? this.sortedAskPrices[0] : null;
+  }
+
+  clear() {
+    this.bids.clear();
+    this.asks.clear();
+    this.orderMap.clear();
+    this.sortedBidPrices = [];
     this.sortedAskPrices = [];
   }
 
   addRestingOrder(orderId, userId, price, amount, side) {
-    const ptr = this.pool.allocate(orderId, userId, price, amount, side);
+    const ptr = this.pool.alloc(orderId, userId, price, amount, side);
     this.orderMap.set(orderId, ptr);
 
-    const levels = side === 0 ? this.bids : this.asks;
-    let level = levels.get(price);
+    const tree = side === 0 ? this.bids : this.asks;
+    let level = tree.get(price);
 
     if (!level) {
       level = {
-        price,
-        totalVolume: 0n,
-        queue: new DoublyLinkedList(this.pool)
+        queue: new DoublyLinkedList(this.pool),
+        totalVolume: 0n
       };
-      levels.set(price, level);
-      this._insertSortedPrice(side, price);
+      tree.set(price, level);
+      this._insertPriceLevel(side, price);
     }
 
-    level.totalVolume += amount;
     level.queue.append(ptr);
+    level.totalVolume += amount;
+
     return ptr;
   }
 
-  /**
-   * O(1) Cancellation by orderId
-   * @param {bigint} orderId
-   * @returns {boolean}
-   */
-  cancel(orderId) {
+  cancel(orderId, requestingUserId = null) {
     const ptr = this.orderMap.get(orderId);
     if (ptr === undefined) return false;
 
+    if (requestingUserId !== null && requestingUserId !== undefined) {
+      const ownerId = this.pool.userId[ptr];
+      if (ownerId !== requestingUserId) {
+        throw new Error('UNAUTHORIZED_CANCEL: Order does not belong to user');
+      }
+    }
+
     const price = this.pool.price[ptr];
-    const side = this.pool.side[ptr];
     const amount = this.pool.amount[ptr];
+    const side = this.pool.side[ptr];
+    const tree = side === 0 ? this.bids : this.asks;
 
-    const levels = side === 0 ? this.bids : this.asks;
-    const level = levels.get(price);
-
+    const level = tree.get(price);
     if (level) {
-      level.queue.remove(ptr);
-      level.totalVolume -= amount;
+      const queue = level.queue || level;
+      if (typeof queue.unlink === 'function') {
+        queue.unlink(ptr);
+      } else if (typeof queue.remove === 'function') {
+        queue.remove(ptr);
+      }
 
-      if (level.queue.isEmpty()) {
-        levels.delete(price);
-        this._removeSortedPrice(side, price);
+      if (level.totalVolume !== undefined) {
+        level.totalVolume -= amount;
+        if (level.totalVolume < 0n) level.totalVolume = 0n;
+      }
+
+      const isEmpty = (queue.length !== undefined && queue.length === 0) ||
+                      (queue.isEmpty && queue.isEmpty()) ||
+                      (queue.head === -1);
+
+      if (isEmpty) {
+        tree.delete(price);
+        this._removePriceLevel(side, price);
       }
     }
 
@@ -76,14 +108,25 @@ class OrderBook {
     return true;
   }
 
-  _insertSortedPrice(side, price) {
+  _insertPriceLevel(side, price) {
     const arr = side === 0 ? this.sortedBidPrices : this.sortedAskPrices;
-    arr.push(price);
+    let low = 0;
+    let high = arr.length;
 
-    arr.sort((a, b) => (side === 0 ? (a > b ? -1 : 1) : (a < b ? -1 : 1)));
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      // Bids: descending (highest price first); Asks: ascending (lowest price first)
+      const cmp = side === 0 ? arr[mid] < price : arr[mid] > price;
+      if (cmp) {
+        high = mid;
+      } else {
+        low = mid + 1;
+      }
+    }
+    arr.splice(low, 0, price);
   }
 
-  _removeSortedPrice(side, price) {
+  _removePriceLevel(side, price) {
     const arr = side === 0 ? this.sortedBidPrices : this.sortedAskPrices;
     const idx = arr.indexOf(price);
     if (idx !== -1) arr.splice(idx, 1);

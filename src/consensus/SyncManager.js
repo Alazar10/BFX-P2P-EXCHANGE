@@ -4,11 +4,6 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 
 class SyncManager {
-  /**
-   * @param {import('./Sequencer').Sequencer} sequencer
-   * @param {import('./SnapshotManager').SnapshotManager} snapshotManager
-   * @param {import('../network/GrenacheTransport').GrenacheTransport} transport
-   */
   constructor(sequencer, snapshotManager, transport) {
     this.sequencer = sequencer;
     this.snapshotManager = snapshotManager;
@@ -61,44 +56,36 @@ class SyncManager {
   async synchronizeWithLeader(leaderNodeId) {
     if (this.isSyncing) return;
     this.isSyncing = true;
+    this.sequencer.isPaused = true; // Pause local processing
 
     try {
       const mySeq = this.sequencer.currentSequence;
-      console.log(`[SyncManager] Requesting state synchronization from Leader (Follower Seq: #${mySeq})...`);
-
       const response = await this.transport.send({
         action: 'SYNC_REQUEST',
         lastAppliedSeqId: mySeq.toString()
       });
 
-      if (response.status === 'IN_SYNC') {
-        console.log(`[SyncManager] Local state is already in sync (Seq #${mySeq}).`);
-        return;
-      }
+      if (response.status === 'IN_SYNC') return;
 
       if (response.status === 'DELTA_STREAM') {
-        console.log(`[SyncManager] Fast catch-up: Replaying ${response.deltas.length} missing transaction deltas...`);
         for (const entry of response.deltas) {
-          this.sequencer.process(entry);
+          // Replay using canonical sequence IDs
+          this.sequencer.applyCommitted(entry);
         }
-        console.log(`[SyncManager] Catch-up complete! Local state advanced to Seq #${this.sequencer.currentSequence}`);
       } else if (response.status === 'SNAPSHOT_TRANSFER') {
-        console.log(`[SyncManager] Large gap detected. Applying verified atomic snapshot...`);
-
         const raw = JSON.stringify(response.snapshotPayload);
         const calcChecksum = crypto.createHash('sha256').update(raw).digest('hex');
 
         if (calcChecksum !== response.checksum) {
-          throw new Error('SYNC_INTEGRITY_VIOLATION: Snapshot checksum mismatch across transport!');
+          throw new Error('SYNC_INTEGRITY_VIOLATION: Snapshot checksum mismatch');
         }
 
         fs.writeFileSync(this.snapshotManager.snapshotPath, raw);
-        this.snapshotManager.loadSnapshot();
+        this.snapshotManager.loadSnapshot(); // Wipes prior memory before loading
         this.sequencer.currentSequence = BigInt(response.snapshotPayload.lastAppliedSeqId);
-        
-        console.log(`[SyncManager] Snapshot applied safely! Synced to Seq #${this.sequencer.currentSequence}`);
       }
     } finally {
+      this.sequencer.isPaused = false;
       this.isSyncing = false;
     }
   }
