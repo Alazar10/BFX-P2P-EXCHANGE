@@ -1,7 +1,7 @@
 'use strict';
 
 const Link = require('grenache-nodejs-link');
-const { PeerRPCServer, PeerRPCClient } = require('grenache-nodejs-ws');
+const { BinaryPeerRPCServer, BinaryPeerRPCClient } = require('./BinaryRPCTransports');
 
 class GrenacheTransport {
   constructor(grapeUrl = 'http://127.0.0.1:30001', port = 1337) {
@@ -9,14 +9,13 @@ class GrenacheTransport {
     this.port = port;
 
     this.link = new Link({ grape: this.grapeUrl });
-    this.link.start();
 
     // RPC Server Peer
-    this.peerServer = new PeerRPCServer(this.link, {});
+    this.peerServer = new BinaryPeerRPCServer(this.link, {});
     this.peerServer.init();
 
     // RPC Client Peer (for forwarding / inter-node Raft messages)
-    this.peerClient = new PeerRPCClient(this.link, {});
+    this.peerClient = new BinaryPeerRPCClient(this.link, {});
     this.peerClient.init();
 
     this.service = null;
@@ -54,6 +53,7 @@ class GrenacheTransport {
    * Initializes WebSocket transport and announces service on Grape DHT
    */
   start(serviceKeys = ['rpc_order_engine']) {
+    this.link.start();
     this.service = this.peerServer.transport('server', {
       maxBuffer: 1024 * 1024
     });

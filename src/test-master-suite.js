@@ -14,6 +14,14 @@ const { SnapshotManager } = require('./consensus/SnapshotManager');
 const { SyncManager } = require('./consensus/SyncManager');
 const { RaftPeerNode } = require('./consensus/RaftPeerNode');
 const { SecurityGate } = require('./network/Security');
+const { validateClientCommand } = require('./engine/CommandValidation');
+const { EtcdOrderLog } = require('./consensus/EtcdOrderLog');
+const {
+  BinaryPeerRPCClient,
+  BinaryPeerRPCServer,
+  BinaryTransportRPCClient,
+  BinaryTransportRPCServer
+} = require('./network/BinaryRPCTransports');
 
 const MASTER_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'bfx-master-test-'));
 
@@ -42,9 +50,9 @@ async function runMasterSuite() {
   console.log('================================================================\n');
 
   let passedTests = 0;
-  const totalTests = 6;
+  const totalTests = 9;
 
-  console.log('[TEST 1/6] Deterministic Matching, Split Fills & Native STP...');
+  console.log('[TEST 1/9] Deterministic Matching, Split Fills & Native STP...');
   {
     const pool = new OrderPool(10000);
     const book = new OrderBook(pool);
@@ -108,7 +116,7 @@ async function runMasterSuite() {
     }
   }
 
-  console.log('[TEST 2/6] Dual-Cancellation Idempotency & Cryptographic Replay Defense...');
+  console.log('[TEST 2/9] Dual-Cancellation Idempotency & Cryptographic Replay Defense...');
   {
     const pool = new OrderPool(10000);
     const book = new OrderBook(pool);
@@ -152,7 +160,7 @@ async function runMasterSuite() {
     }
   }
 
-  console.log('[TEST 3/6] High-Throughput & Tail Latency Benchmark (1,000 Ops)...');
+  console.log('[TEST 3/9] Throughput & Tail Latency Benchmark (1,000 Ops)...');
   {
     const pool = new OrderPool(50000);
     const book = new OrderBook(pool);
@@ -192,11 +200,11 @@ async function runMasterSuite() {
     wal.close();
 
     console.log(`-> Throughput: ${opsPerSec} ops/sec | p50: ${p50}ms | p95: ${p95}ms | p99: ${p99}ms`);
-    console.log('-> Performance & Zero-GC Arena Allocation: PASSED\n');
+    console.log('-> Throughput & Preallocated Slot Storage: PASSED\n');
     passedTests++;
   }
 
-  console.log('[TEST 4/6] WAL Checkpointing & <50ms Recovery SLA...');
+  console.log('[TEST 4/9] WAL Checkpointing & <50ms Recovery SLA...');
   {
     const dataDir = `${MASTER_DATA_DIR}/test4_data`;
     fs.mkdirSync(dataDir, { recursive: true });
@@ -244,7 +252,7 @@ async function runMasterSuite() {
     }
   }
 
-  console.log('[TEST 5/6] Multi-Node Raft Consensus & Zero Split-Brain Divergence...');
+  console.log('[TEST 5/9] Legacy Raft Replication Simulation (not production consensus)...');
   {
     class LocalMeshRouter {
       constructor() { this.nodes = new Map(); }
@@ -358,7 +366,7 @@ async function runMasterSuite() {
     }
   }
 
-  console.log('[TEST 6/6] Anti-Entropy Log-Driven Follower Catch-Up...');
+  console.log('[TEST 6/9] Legacy WAL Anti-Entropy Simulation...');
   {
     const lDir = `${MASTER_DATA_DIR}/leader_sync_data`;
     const fDir = `${MASTER_DATA_DIR}/follower_sync_data`;
@@ -418,6 +426,290 @@ async function runMasterSuite() {
       console.error('-> Anti-Entropy Sync: FAILED\n');
     }
   }
+
+  console.log('[TEST 7/9] Exact Wide-Integer Storage & Strict Command Schema...');
+  {
+    const wideValue = 2n ** 100n + 12345n;
+    const pool = new OrderPool(4);
+    const book = new OrderBook(pool);
+    const engine = new MatchingEngine(book);
+    const wideOrderId = 2n ** 90n + 7n;
+    engine.processOrder(wideOrderId, 1n, wideValue, wideValue, 1, STPMode.CANCEL_TAKER);
+
+    const validRequestId = crypto.randomUUID();
+    const acceptedCommand = validateClientCommand({
+      type: 'ORDER_CREATE',
+      orderId: wideOrderId.toString(),
+      price: wideValue.toString(),
+      amount: wideValue.toString(),
+      side: 0,
+      stpMode: STPMode.CANCEL_TAKER,
+      requestId: validRequestId
+    });
+    let invalidCommandsRejected = 0;
+    const invalidCommands = [
+      { type: 'ORDER_CREATE', orderId: '1', price: 1, amount: '1', side: 0, stpMode: 1, requestId: validRequestId },
+      { type: 'ORDER_CREATE', orderId: '1', price: '1e6', amount: '1', side: 0, stpMode: 1, requestId: validRequestId },
+      { type: 'ORDER_CREATE', orderId: '1', price: '1', amount: '1'.repeat(257), side: 0, stpMode: 1, requestId: validRequestId },
+      { type: 'ORDER_CREATE', orderId: '1', price: '1', amount: '1', side: 0, stpMode: 0, requestId: validRequestId },
+      { type: 'ORDER_CANCEL', orderId: '1', userId: 'forged', requestId: validRequestId }
+    ];
+    for (const command of invalidCommands) {
+      try {
+        validateClientCommand(command);
+      } catch {
+        invalidCommandsRejected++;
+      }
+    }
+
+    let duplicateRejected = false;
+    try {
+      book.addRestingOrder(wideOrderId, 1n, wideValue, 1n, 1);
+    } catch (error) {
+      duplicateRejected = error.message.startsWith('DUPLICATE_ORDER_ID');
+    }
+
+    const ptr = book.orderMap.get(wideOrderId);
+    const exactStorage =
+      pool.orderId[ptr] === wideOrderId &&
+      pool.price[ptr] === wideValue &&
+      pool.amount[ptr] === wideValue;
+    let linkedSlotFreeRejected = false;
+    try {
+      pool.free(ptr);
+    } catch {
+      linkedSlotFreeRejected = true;
+    }
+    book.cancel(wideOrderId);
+    let doubleFreeRejected = false;
+    try {
+      pool.free(ptr);
+    } catch {
+      doubleFreeRejected = true;
+    }
+    let unsafeNumberRejected = false;
+    try {
+      engine.processOrder(Number.MAX_SAFE_INTEGER + 1, 1n, 1n, 1n, 1, STPMode.CANCEL_TAKER);
+    } catch {
+      unsafeNumberRejected = true;
+    }
+    const schemaPassed = exactStorage && invalidCommandsRejected === invalidCommands.length &&
+      duplicateRejected && linkedSlotFreeRejected && doubleFreeRejected && unsafeNumberRejected &&
+      acceptedCommand.orderId === wideOrderId && acceptedCommand.amount === wideValue &&
+      acceptedCommand.requestId === validRequestId;
+
+    if (schemaPassed) {
+      console.log('-> >64-bit values remain exact; malformed and duplicate commands rejected: PASSED\n');
+      passedTests++;
+    } else {
+      console.error('-> Wide Integer / Strict Schema: FAILED\n');
+    }
+  }
+
+  console.log('[TEST 8/9] MessagePack RPC Frames & HMAC Integrity...');
+  {
+    const transport = new BinaryTransportRPCClient({}, {});
+    const peerClient = new BinaryPeerRPCClient({}, {});
+    const peerServer = new BinaryPeerRPCServer({}, {});
+    const message = ['req-1', 'rpc_order_engine', {
+      type: 'ORDER_CREATE',
+      price: (2n ** 100n).toString(),
+      amount: '12'
+    }];
+    const frame = transport.format(message);
+    const decoded = transport.parse(frame);
+    const peerSecurity = new SecurityGate({
+      node_a: 'a'.repeat(40),
+      node_b: 'b'.repeat(40)
+    });
+    const envelope = peerSecurity.signClusterMessage('node_a', { action: 'RAFT_HEARTBEAT' });
+    const validPeerAccepted = peerSecurity.verifyClusterMessage(envelope, ['node_a', 'node_b']);
+    let identitySwapRejected = false;
+    try {
+      peerSecurity.verifyClusterMessage(
+        { ...envelope, nodeId: 'node_b' },
+        ['node_a', 'node_b']
+      );
+    } catch {
+      identitySwapRejected = true;
+    }
+
+    if (peerClient.getTransportClass() === BinaryTransportRPCClient &&
+        peerServer.getTransportClass() === BinaryTransportRPCServer &&
+        Buffer.isBuffer(frame) &&
+        frame.length < Buffer.byteLength(JSON.stringify(message)) &&
+        decoded &&
+        JSON.stringify(decoded) === JSON.stringify(message) &&
+        validPeerAccepted.nodeId === 'node_a' && identitySwapRejected) {
+      console.log('-> Compact binary frame round-trip and distinct peer key verification: PASSED\n');
+      passedTests++;
+    } else {
+      console.error('-> Binary RPC / Peer Authentication: FAILED\n');
+    }
+  }
+
+    console.log('[TEST 9/9] Concurrent Linearizable etcd Ordering & Idempotent Retry...');
+    {
+      const kv = new Map();
+      let revision = 0;
+      const mockEtcdFetch = async (_url, options) => {
+        const request = JSON.parse(options.body);
+        const readKey = (key) => kv.get(Buffer.from(key, 'base64').toString('utf8'));
+        let response;
+        if (_url.endsWith('/v3/kv/range')) {
+          const key = Buffer.from(request.key, 'base64').toString('utf8');
+          const rangeEnd = request.rangeEnd
+            ? Buffer.from(request.rangeEnd, 'base64').toString('utf8')
+            : null;
+          const rangedEntries = [...kv.entries()]
+            .filter(([candidate]) => rangeEnd
+              ? candidate >= key && candidate < rangeEnd
+              : candidate === key)
+            .sort(([left], [right]) => left.localeCompare(right));
+          const entries = (request.limit
+            ? rangedEntries.slice(0, request.limit)
+            : rangedEntries)
+            .map(([candidate, value]) => ({
+              key: Buffer.from(candidate).toString('base64'),
+              value: Buffer.from(value.value).toString('base64'),
+              mod_revision: value.modRevision,
+              version: value.version
+            }));
+          response = { kvs: entries };
+        } else if (_url.endsWith('/v3/kv/txn')) {
+          const succeeded = request.compare.every((condition) => {
+            const current = readKey(condition.key);
+            if (condition.target === 'VERSION') {
+              return Number(current ? current.version : 0) === Number(condition.version);
+            }
+            if (condition.target === 'MOD') {
+              return current && current.modRevision === condition.modRevision;
+            }
+            return false;
+          });
+          if (succeeded) {
+            revision++;
+            for (const operation of request.success) {
+              const put = operation.requestPut;
+              const key = Buffer.from(put.key, 'base64').toString('utf8');
+              const old = kv.get(key);
+              kv.set(key, {
+                value: Buffer.from(put.value, 'base64').toString('utf8'),
+                modRevision: String(revision),
+                version: String(old ? Number(old.version) + 1 : 1)
+              });
+            }
+          }
+          response = { succeeded };
+        } else {
+          throw new Error(`Unexpected etcd endpoint ${_url}`);
+        }
+        return {
+          ok: true,
+          status: 200,
+          async text() { return JSON.stringify(response); }
+        };
+      };
+
+      const createNode = (name) => {
+        const dir = `${MASTER_DATA_DIR}/${name}_etcd`;
+        const pool = new OrderPool(16);
+        const book = new OrderBook(pool);
+        const engine = new MatchingEngine(book);
+        const wal = new WriteAheadLog(`${dir}/engine.wal`);
+        const sequencer = new Sequencer(engine, wal, 10000, dir);
+        const log = new EtcdOrderLog(sequencer, {
+          endpoints: 'http://127.0.0.1:2379',
+          prefix: '/test/exchange',
+          fetchImpl: mockEtcdFetch
+        });
+        return { book, wal, sequencer, log };
+      };
+
+      const a = createNode('a');
+      const b = createNode('b');
+      const c = createNode('c');
+      const d = createNode('d');
+      const requestA = crypto.randomUUID();
+      const requestB = crypto.randomUUID();
+      const commandA = {
+        type: 'ORDER_CREATE',
+        orderId: 9001n,
+        userId: 91n,
+        price: 1200n,
+        amount: 4n,
+        side: 1,
+        stpMode: STPMode.CANCEL_TAKER
+      };
+      const commandB = {
+        type: 'ORDER_CREATE',
+        orderId: 9002n,
+        userId: 92n,
+        price: 1201n,
+        amount: 5n,
+        side: 1,
+        stpMode: STPMode.CANCEL_TAKER
+      };
+
+      try {
+        const [resultA, resultB] = await Promise.all([
+          a.log.submit(commandA, requestA),
+          b.log.submit(commandB, requestB)
+        ]);
+        await Promise.all([a.log.catchUp(), b.log.catchUp(), c.log.catchUp()]);
+        const duplicate = await a.log.submit(commandA, requestA);
+        const conflictCommand = { ...commandA, amount: 7n };
+        let requestConflictRejected = false;
+        try {
+          await a.log.submit(conflictCommand, requestA);
+        } catch (error) {
+          requestConflictRejected = error.message.startsWith('IDEMPOTENCY_CONFLICT');
+        }
+        const cancelResult = await b.log.submit({
+          type: 'ORDER_CANCEL',
+          orderId: commandA.orderId,
+          userId: commandA.userId
+        }, crypto.randomUUID());
+        await Promise.all([a.log.catchUp(), c.log.catchUp()]);
+        let reusedOrderIdRejected = false;
+        try {
+          await c.log.submit({ ...commandA, amount: 8n }, crypto.randomUUID());
+        } catch (error) {
+          reusedOrderIdRejected = error.message.startsWith('DUPLICATE_ORDER_ID');
+        }
+        kv.delete('/test/exchange/sequence');
+        let missingSequenceGuarded = false;
+        try {
+          await d.log.catchUp();
+        } catch (error) {
+          missingSequenceGuarded = error.message.startsWith('ETCD_SEQUENCE_MISSING');
+        }
+
+        const sameState =
+          a.sequencer.currentSequence === 3n &&
+          b.sequencer.currentSequence === 3n &&
+          c.sequencer.currentSequence === 3n &&
+          calculateOrderBookHash(a.book) === calculateOrderBookHash(b.book) &&
+          calculateOrderBookHash(b.book) === calculateOrderBookHash(c.book);
+        const uniqueSequences = [resultA.seqId, resultB.seqId].sort((left, right) =>
+          left < right ? -1 : left > right ? 1 : 0
+        );
+        if (sameState && uniqueSequences[0] === 1n && uniqueSequences[1] === 2n &&
+            duplicate.seqId === resultA.seqId && !duplicate.duplicate &&
+            requestConflictRejected && cancelResult.seqId === 3n && reusedOrderIdRejected &&
+            missingSequenceGuarded) {
+          console.log('-> CAS ordering, recovery, retries, ID uniqueness, and log-corruption guard: PASSED\n');
+          passedTests++;
+        } else {
+          console.error('-> etcd Ordering / Idempotency: FAILED\n');
+        }
+      } finally {
+        a.wal.close();
+        b.wal.close();
+        c.wal.close();
+        d.wal.close();
+      }
+    }
 
   console.log('================================================================');
   console.log(` MASTER TEST SUMMARY: ${passedTests}/${totalTests} SUITES PASSED`);

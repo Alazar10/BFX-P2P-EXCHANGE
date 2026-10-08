@@ -9,8 +9,9 @@ class SecurityGate {
    * @param {Record<string, string>|null} apiKeySecrets - Per-client signing secrets
    */
   constructor(clusterSecret, maxDriftMs = 5000, apiKeySecrets = null) {
-    if (!clusterSecret || typeof clusterSecret !== 'string') {
-      throw new Error('SECURITY_INIT_ERROR: clusterSecret must be a valid non-empty string');
+    if ((!clusterSecret || typeof clusterSecret !== 'string') &&
+        (!clusterSecret || typeof clusterSecret !== 'object' || Array.isArray(clusterSecret))) {
+      throw new Error('SECURITY_INIT_ERROR: cluster secrets must be a string or peer-secret map');
     }
     this.clusterSecret = clusterSecret;
     this.maxDriftMs = maxDriftMs;
@@ -22,6 +23,8 @@ class SecurityGate {
     // Inbound verification watermark: Map<apiKey, bigint>
     this.receivedWatermarks = new Map();
     this.receivedClusterNonces = new Map();
+    this.clusterNonceQueue = [];
+    this.clusterNonceQueueHead = 0;
   }
 
   /**
@@ -59,8 +62,10 @@ class SecurityGate {
     const timestamp = Date.now();
     const nonce = crypto.randomUUID();
     const canonical = `${nodeId}:${timestamp}:${nonce}:${this._stableSerialize(message)}`;
+    const signingSecret = this._clusterSecretFor(nodeId);
+    if (!signingSecret) throw new Error('CLUSTER_AUTH_ERROR: No secret configured for this node');
     const signature = crypto
-      .createHmac('sha256', this.clusterSecret)
+      .createHmac('sha256', signingSecret)
       .update(canonical)
       .digest('hex');
 
@@ -82,18 +87,32 @@ class SecurityGate {
     if (Math.abs(now - envelope.timestamp) > this.maxDriftMs) {
       throw new Error('CLUSTER_AUTH_REJECT: Peer message timestamp expired');
     }
+    const signingSecret = this._clusterSecretFor(envelope.nodeId);
+    if (!signingSecret) {
+      throw new Error('CLUSTER_AUTH_REJECT: No secret configured for claimed peer');
+    }
 
     const replayKey = `${envelope.nodeId}:${envelope.nonce}`;
-    for (const [key, timestamp] of this.receivedClusterNonces) {
-      if (now - timestamp > this.maxDriftMs) this.receivedClusterNonces.delete(key);
+    while (this.clusterNonceQueueHead < this.clusterNonceQueue.length &&
+        now - this.clusterNonceQueue[this.clusterNonceQueueHead][1] > this.maxDriftMs) {
+      const [expiredKey] = this.clusterNonceQueue[this.clusterNonceQueueHead++];
+      this.receivedClusterNonces.delete(expiredKey);
+    }
+    if (this.clusterNonceQueueHead > 1024 &&
+        this.clusterNonceQueueHead * 2 > this.clusterNonceQueue.length) {
+      this.clusterNonceQueue = this.clusterNonceQueue.slice(this.clusterNonceQueueHead);
+      this.clusterNonceQueueHead = 0;
     }
     if (this.receivedClusterNonces.has(replayKey)) {
       throw new Error('CLUSTER_AUTH_REJECT: Replayed peer message');
     }
+    if (this.receivedClusterNonces.size >= 100000) {
+      throw new Error('CLUSTER_AUTH_REJECT: Peer replay window is at capacity');
+    }
 
     const canonical = `${envelope.nodeId}:${envelope.timestamp}:${envelope.nonce}:${this._stableSerialize(envelope.message)}`;
     const expectedSig = crypto
-      .createHmac('sha256', this.clusterSecret)
+      .createHmac('sha256', signingSecret)
       .update(canonical)
       .digest('hex');
     const sigBuf = Buffer.from(envelope.signature, 'hex');
@@ -103,7 +122,14 @@ class SecurityGate {
     }
 
     this.receivedClusterNonces.set(replayKey, now);
+    this.clusterNonceQueue.push([replayKey, now]);
     return { nodeId: envelope.nodeId, message: envelope.message };
+  }
+
+  _clusterSecretFor(nodeId) {
+    return typeof this.clusterSecret === 'string'
+      ? this.clusterSecret
+      : this.clusterSecret[nodeId];
   }
 
   /**

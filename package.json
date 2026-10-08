@@ -3,12 +3,23 @@
   "version": "1.0.0",
   "description": "Deterministic Low-Latency P2P Matching Engine over Grenache",
   "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node src/index.js",
     "test": "node src/test-master-suite.js"
   },
   "dependencies": {
+    "@msgpack/msgpack": "^3.1.2",
     "grenache-nodejs-link": "^1.0.2",
-    "grenache-nodejs-ws": "^1.0.0"
+    "grenache-nodejs-ws": "^1.0.0",
+    "ws": "^8.18.0"
+  },
+  "overrides": {
+    "uuid": "^11.1.1",
+    "grenache-nodejs-ws": {
+      "ws": "^7.5.11"
+    }
   }
 }
