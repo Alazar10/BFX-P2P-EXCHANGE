@@ -146,6 +146,7 @@ class RaftPeerNode extends EventEmitter {
   }
 
   async _submitTransaction(command) {
+    this.sequencer.validateCommand(command);
     if (this.role !== NodeRole.LEADER) {
       if (!this.leaderId) throw new Error('NO_LEADER_ELECTED_YET');
       return this._sendPeer(this.leaderId, {
@@ -297,6 +298,7 @@ class RaftPeerNode extends EventEmitter {
         term: msg.term,
         proposalIndex: msg.proposalIndex
       };
+      this.sequencer.validateCommand(stagedEntry);
       this.sequencer.wal.append({
         type: 'RAFT_PREPARE',
         seqId: stagedEntry.seqId,

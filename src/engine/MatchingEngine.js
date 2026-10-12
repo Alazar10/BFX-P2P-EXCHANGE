@@ -6,6 +6,7 @@ const STPMode = Object.freeze({
   CANCEL_MAKER: 2,
   CANCEL_BOTH: 3
 });
+const { toUnsignedBigInt } = require('./Integer');
 
 class MatchingEngine {
   /**
@@ -21,6 +22,17 @@ class MatchingEngine {
    * @returns {{ fills: Array<object>, remainingAmount: bigint }}
    */
   processOrder(orderId, userId, price, amount, side, stpMode = STPMode.CANCEL_TAKER) {
+    orderId = toUnsignedBigInt(orderId, 'orderId', { positive: true });
+    userId = toUnsignedBigInt(userId, 'userId');
+    price = toUnsignedBigInt(price, 'price', { positive: true });
+    amount = toUnsignedBigInt(amount, 'amount', { positive: true });
+    if (!Number.isInteger(side) || (side !== 0 && side !== 1)) {
+      throw new Error('INVALID_ORDER: side must be 0 (BUY) or 1 (SELL)');
+    }
+    if (!Number.isInteger(stpMode) ||
+        ![STPMode.NONE, STPMode.CANCEL_TAKER, STPMode.CANCEL_MAKER, STPMode.CANCEL_BOTH].includes(stpMode)) {
+      throw new Error('INVALID_ORDER: Invalid self-trade prevention mode');
+    }
     let remainingAmount = amount;
     const fills = [];
 

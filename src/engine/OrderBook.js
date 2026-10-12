@@ -1,6 +1,7 @@
 'use strict';
 
 const { DoublyLinkedList } = require('./DoublyLinkedList');
+const { toUnsignedBigInt } = require('./Integer');
 
 class OrderBook {
   /**
@@ -42,19 +43,24 @@ class OrderBook {
   }
 
   addRestingOrder(orderId, userId, price, amount, side) {
+    const normalizedOrderId = toUnsignedBigInt(orderId, 'orderId', { positive: true });
+    const normalizedPrice = toUnsignedBigInt(price, 'price', { positive: true });
+    if (this.orderMap.has(normalizedOrderId)) {
+      throw new Error('DUPLICATE_ORDER_ID: Order ID is already resting');
+    }
     const ptr = this.pool.alloc(orderId, userId, price, amount, side);
-    this.orderMap.set(orderId, ptr);
+    this.orderMap.set(normalizedOrderId, ptr);
 
     const tree = side === 0 ? this.bids : this.asks;
-    let level = tree.get(price);
+    let level = tree.get(normalizedPrice);
 
     if (!level) {
       level = {
         queue: new DoublyLinkedList(this.pool),
         totalVolume: 0n
       };
-      tree.set(price, level);
-      this._insertPriceLevel(side, price);
+      tree.set(normalizedPrice, level);
+      this._insertPriceLevel(side, normalizedPrice);
     }
 
     level.queue.append(ptr);

@@ -1,7 +1,7 @@
 'use strict';
 
 const Link = require('grenache-nodejs-link');
-const { PeerRPCClient } = require('grenache-nodejs-ws');
+const { BinaryPeerRPCClient } = require('./network/BinaryRPCTransports');
 const { SecurityGate } = require('./network/Security');
 
 const SCALE = 100000000n;
@@ -16,7 +16,7 @@ const CONCURRENCY = 20;
 const link = new Link({ grape: process.env.GRAPE_URL || 'http://127.0.0.1:40001' });
 link.start();
 
-const peer = new PeerRPCClient(link, { maxActiveKeyDests: 10 });
+const peer = new BinaryPeerRPCClient(link, { maxActiveKeyDests: 10 });
 peer.init();
 const security = new SecurityGate(API_SECRET);
 
@@ -25,18 +25,17 @@ let orderCounter = 0n;
 function sendBenchmarkOrder(i) {
   return new Promise((resolve, reject) => {
     const isBuy = i % 2 === 0;
-    const userId = isBuy ? '202' : '101';
     const price = 65000n * SCALE;
     const amount = (1n * SCALE) / 100n; // 0.01 BTC
 
     const cmd = {
       type: 'ORDER_CREATE',
       orderId: (++orderCounter).toString(),
-      userId,
       price: price.toString(),
       amount: amount.toString(),
       side: isBuy ? 0 : 1,
-      stpMode: 0
+      stpMode: 1,
+      requestId: crypto.randomUUID()
     };
 
     const envelope = security.sign(cmd, API_KEY);
