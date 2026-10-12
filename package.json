@@ -4,11 +4,12 @@
   "description": "Deterministic Low-Latency P2P Matching Engine over Grenache",
   "main": "src/index.js",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.6"
   },
   "scripts": {
-    "start": "node src/index.js",
-    "test": "node src/test-master-suite.js"
+    "start": "node --env-file=.env src/index.js",
+    "test": "node src/test-master-suite.js",
+    "test:race": "node --env-file=.env src/test-race-conditions.js"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.1.2",

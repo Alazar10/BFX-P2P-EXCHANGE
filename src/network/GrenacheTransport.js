@@ -21,6 +21,7 @@ class GrenacheTransport {
     this.service = null;
     this.requestHandler = null;
     this.announceInterval = null;
+    this.linkStarted = false;
   }
 
   /**
@@ -54,6 +55,7 @@ class GrenacheTransport {
    */
   start(serviceKeys = ['rpc_order_engine']) {
     this.link.start();
+    this.linkStarted = true;
     this.service = this.peerServer.transport('server', {
       maxBuffer: 1024 * 1024
     });
@@ -94,7 +96,10 @@ class GrenacheTransport {
     if (this.service) this.service.stop();
     if (this.peerServer) this.peerServer.stop();
     if (this.peerClient) this.peerClient.stop();
-    if (this.link) this.link.stop();
+    if (this.link && this.linkStarted) {
+      this.link.stop();
+      this.linkStarted = false;
+    }
   }
 }
 

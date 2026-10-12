@@ -10,9 +10,9 @@ The engine requires an etcd v3 cluster and explicit secrets; it does not ship wi
 - `CLIENT_API_KEYS`: a JSON object mapping each API key to its own unique secret, for example `{"trader-a":"<secret-a>","trader-b":"<secret-b>"}`. Each secret must be at least 32 characters. Configure the same mapping on every engine node.
 - `NODE_ID`: this node's unique ID.
 - `GRAPE_URL` and `PORT`: the node's Grape endpoint and listening port.
-- Node.js 20 or later is required.
+- Node.js 20.6 or later is required for built-in `.env` loading.
 
-Start the engine after exporting those values with `npm start`. Client programs must receive only their own `API_KEY` and `API_SECRET`; the pair must match an entry in `CLIENT_API_KEYS`. Never put a peer secret in a client or commit any real secret to the repository.
+For local development, copy `.env.example` to `.env`, set a fresh secret in both `API_SECRET` and `CLIENT_API_KEYS`, and use an isolated `ETCD_PREFIX`/`NODE_ID`. `npm start` loads `.env` automatically. Never commit `.env` or reuse its development secret in production. Client programs must receive only their own `API_KEY` and `API_SECRET`; the pair must match an entry in `CLIENT_API_KEYS`.
 
 ## Order input and numeric guarantees
 
@@ -30,4 +30,4 @@ RPC frames use MessagePack over WebSocket with a 1 MiB frame cap. Client payload
 
 - `npm test` runs the in-process master regression suite. Its etcd ordering checks use a mock etcd API.
 - `node src/test-distributed-divergence.js` runs a legacy in-process Raft simulation with isolated temporary WAL files. It does not test the production etcd ordering path.
-- `node src/test-race-conditions.js` is an integration test: start the etcd-backed engine and Grenache network first, then set `API_KEY` and `API_SECRET` to a client account present in the engine's `CLIENT_API_KEYS`. Set `GRAPE_URL` if Grape is not at `http://127.0.0.1:30001`.
+- `npm run test:race` is an integration test: start the etcd-backed engine and Grenache network first. It loads the matching local client credentials from `.env`; edit that file if needed. Set `GRAPE_URL` if Grape is not at `http://127.0.0.1:30001`.
